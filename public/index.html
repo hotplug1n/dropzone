@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Dropzone — YouTube Downloader</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, sans-serif; max-width: 480px; margin: 40px auto; padding: 0 16px; }
+  fieldset { border: 1px solid #8884; border-radius: 8px; margin-bottom: 16px; }
+  label { display: block; margin: 8px 0; }
+  input[type="url"], select { width: 100%; padding: 8px; box-sizing: border-box; }
+  button { width: 100%; padding: 12px; font-size: 1rem; cursor: pointer; }
+  button:disabled { opacity: 0.6; cursor: not-allowed; }
+  #status { margin-top: 16px; min-height: 1.5em; }
+  #status.error { color: #c0392b; }
+  #status.done { color: #27ae60; }
+  fieldset[disabled] { opacity: 0.5; }
+</style>
+</head>
+<body>
+  <h1>Dropzone</h1>
+  <form id="download-form">
+    <label>
+      URL do YouTube
+      <input type="url" id="url" name="url" placeholder="https://www.youtube.com/watch?v=..." required />
+    </label>
+
+    <fieldset>
+      <legend>Formato</legend>
+      <label><input type="radio" name="format" value="mp4" checked /> MP4 — Vídeo</label>
+      <label><input type="radio" name="format" value="mp3" /> MP3 — Áudio</label>
+    </fieldset>
+
+    <fieldset id="quality-group">
+      <legend>Qualidade</legend>
+      <select id="quality" name="quality"></select>
+    </fieldset>
+
+    <fieldset id="bitrate-group" disabled>
+      <legend>Bitrate</legend>
+      <select id="bitrate" name="bitrate"></select>
+    </fieldset>
+
+    <button type="submit" id="submit-btn">DOWNLOAD</button>
+  </form>
+
+  <div id="status" role="status"></div>
+
+  <script>
+    const formatRadios = document.querySelectorAll('input[name="format"]');
+    const qualityGroup = document.getElementById('quality-group');
+    const bitrateGroup = document.getElementById('bitrate-group');
+    const qualitySelect = document.getElementById('quality');
+    const bitrateSelect = document.getElementById('bitrate');
+    const statusEl = document.getElementById('status');
+    const submitBtn = document.getElementById('submit-btn');
+    const form = document.getElementById('download-form');
+
+    function fillSelect(select, values, labelFn) {
+      select.innerHTML = '';
+      for (const v of values) {
+        const opt = document.createElement('option');
+        opt.value = v;
+        opt.textContent = labelFn ? labelFn(v) : v;
+        select.appendChild(opt);
+      }
+    }
+
+    function syncFieldset() {
+      const format = document.querySelector('input[name="format"]:checked').value;
+      const isMp4 = format === 'mp4';
+      qualityGroup.disabled = !isMp4;
+      bitrateGroup.disabled = isMp4;
+    }
+
+    async function loadOptions() {
+      const res = await fetch('/api/config');
+      const cfg = await res.json();
+      fillSelect(qualitySelect, cfg.videoQualities, (v) => (v === 'best' ? 'Melhor disponível' : `${v}p`));
+      fillSelect(bitrateSelect, cfg.audioBitrates, (v) => `${v} kbps`);
+      qualitySelect.value = '1080';
+      bitrateSelect.value = '192';
+      syncFieldset();
+    }
+
+    formatRadios.forEach((r) => r.addEventListener('change', syncFieldset));
+    loadOptions();
+
+    form.addEventListener('submit', (e) => {
+      e.preventDefault();
+      const url = document.getElementById('url').value.trim();
+      const format = document.querySelector('input[name="format"]:checked').value;
+      const quality = qualitySelect.value;
+      const bitrate = bitrateSelect.value;
+
+      submitBtn.disabled = true;
+      statusEl.className = '';
+      statusEl.textContent = 'Validando URL...';
+
+      const params = new URLSearchParams({ url, format, quality, bitrate });
+      const source = new EventSource(`/api/download-stream?${params.toString()}`);
+
+      source.addEventListener('progress', (ev) => {
+        const { step } = JSON.parse(ev.data);
+        statusEl.textContent = step;
+      });
+
+      source.addEventListener('done', (ev) => {
+        const { downloadUrl, filename } = JSON.parse(ev.data);
+        statusEl.className = 'done';
+        statusEl.innerHTML = `Concluído. <a href="${downloadUrl}" download>${filename}</a>`;
+        submitBtn.disabled = false;
+        source.close();
+      });
+
+      source.addEventListener('error', (ev) => {
+        submitBtn.disabled = false;
+        statusEl.className = 'error';
+        if (ev.data) {
+          const { code, message } = JSON.parse(ev.data);
+          statusEl.textContent = `Não foi possível concluir o download. Código: ${code}. Detalhes: ${message}`;
+        } else {
+          statusEl.textContent = 'Não foi possível concluir o download. Verifique sua conexão.';
+        }
+        source.close();
+      });
+    });
+  </script>
+</body>
+</html>

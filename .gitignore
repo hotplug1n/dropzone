@@ -7,3 +7,5 @@ dist/
 .output/
 .wrangler/
 .cache/
+downloads/
+tmp/

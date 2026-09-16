@@ -1,0 +1,20 @@
+{
+  "name": "dropzone",
+  "version": "1.0.0",
+  "description": "YouTube MP4/MP3 downloader using a self-hosted Cobalt-compatible API as backend, with local FFmpeg post-processing and validation.",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test test/unit/*.test.js",
+    "test:integration": "node --test test/integration/*.test.js"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.21.2",
+    "ipaddr.js": "^2.2.0"
+  }
+}
