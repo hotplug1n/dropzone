@@ -32,7 +32,9 @@ function baseConfig(overrides = {}) {
   const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dz-int-'));
   return {
     cobaltApiKey: '',
-    downloadTimeoutMs: 15_000,
+    cobaltConnectTimeoutMs: 15_000,
+    cobaltRequestTimeoutMs: 15_000,
+    cobaltRetries: 0,
     ffmpegTimeoutMs: 30_000,
     ffmpegPath: 'ffmpeg',
     ffprobePath: 'ffprobe',
@@ -66,22 +68,32 @@ test('integration: MP4 download via local-processing (merge, 2 streams) produces
 
   try {
     const config = baseConfig({ cobaltApiUrl: baseUrl });
-    const progressSteps = [];
+    const progressEvents = [];
 
     const result = await downloadYoutubeMedia({
       url: YOUTUBE_URL,
       format: 'mp4',
       quality: '720',
       config,
-      onProgress: (s) => progressSteps.push(s),
+      onProgress: (p) => progressEvents.push(p),
     });
 
     assert.ok(fs.existsSync(result.path), 'output file must exist on disk');
     assert.ok(result.path.endsWith('.mp4'));
     assert.ok(result.sizeBytes > 0);
-    assert.deepEqual(progressSteps, [
-      'Validando URL...', 'Obtendo mídia...', 'Baixando...', 'Processando...', 'Finalizando...', 'Concluído.',
-    ]);
+
+    const steps = progressEvents.map((p) => p.step);
+    assert.ok(steps.includes('Validando URL...'));
+    assert.ok(steps.includes('Obtendo mídia...'));
+    assert.ok(steps.includes('Baixando...'));
+    assert.ok(steps.includes('Processando...'));
+    assert.ok(steps.includes('Finalizando...'));
+    assert.ok(steps.includes('Concluído.'));
+    // At least one "Processando..." event must carry a real ffmpeg-derived
+    // percent (from -progress out_time_ms), not a fabricated animation.
+    const withPercent = progressEvents.filter((p) => p.step === 'Processando...' && typeof p.percent === 'number');
+    assert.ok(withPercent.length > 0, 'expected at least one real progress percentage during muxing');
+    assert.ok(withPercent.every((p) => p.percent >= 0 && p.percent <= 100));
 
     const probe = await probeFile(result.path);
     assert.ok(probe.formatName.includes('mp4'), `expected mp4 container, got ${probe.formatName}`);

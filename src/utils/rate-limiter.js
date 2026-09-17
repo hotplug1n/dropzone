@@ -4,7 +4,18 @@
 export function createRateLimiter({ windowMs, max }) {
   const hits = new Map(); // ip -> { count, resetAt }
 
-  return function rateLimit(req, res, next) {
+  // Without this sweep, every distinct IP ever seen stays in the map
+  // forever — a slow but real memory leak on a long-running process.
+  // unref() so this timer never keeps the process (or a test run) alive.
+  const sweepInterval = setInterval(() => {
+    const now = Date.now();
+    for (const [ip, entry] of hits) {
+      if (entry.resetAt <= now) hits.delete(ip);
+    }
+  }, windowMs);
+  sweepInterval.unref?.();
+
+  const middleware = function rateLimit(req, res, next) {
     const ip = req.ip || 'unknown';
     const now = Date.now();
     let entry = hits.get(ip);
@@ -30,6 +41,9 @@ export function createRateLimiter({ windowMs, max }) {
 
     next();
   };
+
+  middleware.stop = () => clearInterval(sweepInterval);
+  return middleware;
 }
 
 export class Semaphore {

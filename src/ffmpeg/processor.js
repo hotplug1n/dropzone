@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import readline from 'node:readline';
 import { ProcessingError, TimeoutError } from '../errors/downloader-errors.js';
 
 const STDERR_TAIL_LIMIT = 4000;
@@ -8,14 +9,25 @@ const STDERR_TAIL_LIMIT = 4000;
  * never through a shell, so user-controlled strings (titles, URLs) can
  * never be interpreted as shell syntax. Applies a hard timeout, captures
  * stderr for diagnostics, and guarantees the child process is not left
- * orphaned.
+ * orphaned. Also honors an external AbortSignal, so a caller can cancel a
+ * running ffmpeg job (e.g. the browser disconnected) without waiting for
+ * the full timeout.
+ *
+ * @param {string} cmdPath
+ * @param {string[]} args
+ * @param {object} [opts]
+ * @param {number} [opts.timeoutMs]
+ * @param {string} [opts.label]
+ * @param {AbortSignal} [opts.signal]
+ * @param {(line: string) => void} [opts.onStdoutLine] - called per stdout line, for progress parsing.
  */
-function runProcess(cmdPath, args, { timeoutMs = 300_000, label = cmdPath } = {}) {
+function runProcess(cmdPath, args, { timeoutMs = 300_000, label = cmdPath, signal, onStdoutLine } = {}) {
   return new Promise((resolve, reject) => {
     let stderrTail = '';
     let stdoutBuf = '';
     let settled = false;
     let killTimer;
+    let killReason = null; // 'timeout' | 'abort'
 
     let child;
     try {
@@ -25,18 +37,32 @@ function runProcess(cmdPath, args, { timeoutMs = 300_000, label = cmdPath } = {}
       return;
     }
 
-    const timeoutTimer = setTimeout(() => {
+    const kill = (reason) => {
       if (settled) return;
+      killReason = reason;
       child.kill('SIGTERM');
       killTimer = setTimeout(() => {
         if (child.exitCode === null) child.kill('SIGKILL');
       }, 5000);
-    }, timeoutMs);
+    };
 
-    child.stdout.on('data', (chunk) => {
-      stdoutBuf += chunk.toString('utf8');
-      if (stdoutBuf.length > 10 * 1024 * 1024) stdoutBuf = stdoutBuf.slice(-1024 * 1024);
-    });
+    const timeoutTimer = setTimeout(() => kill('timeout'), timeoutMs);
+
+    const onAbort = () => kill('abort');
+    if (signal) {
+      if (signal.aborted) onAbort();
+      else signal.addEventListener('abort', onAbort, { once: true });
+    }
+
+    if (onStdoutLine) {
+      const rl = readline.createInterface({ input: child.stdout });
+      rl.on('line', onStdoutLine);
+    } else {
+      child.stdout.on('data', (chunk) => {
+        stdoutBuf += chunk.toString('utf8');
+        if (stdoutBuf.length > 10 * 1024 * 1024) stdoutBuf = stdoutBuf.slice(-1024 * 1024);
+      });
+    }
 
     child.stderr.on('data', (chunk) => {
       stderrTail += chunk.toString('utf8');
@@ -45,27 +71,39 @@ function runProcess(cmdPath, args, { timeoutMs = 300_000, label = cmdPath } = {}
       }
     });
 
+    const cleanup = () => {
+      clearTimeout(timeoutTimer);
+      clearTimeout(killTimer);
+      signal?.removeEventListener('abort', onAbort);
+    };
+
     child.on('error', (cause) => {
       if (settled) return;
       settled = true;
-      clearTimeout(timeoutTimer);
-      clearTimeout(killTimer);
+      cleanup();
       reject(new ProcessingError(`${label} process failed to start or crashed`, {
         context: { cmdPath, args: redactArgs(args) },
         cause,
       }));
     });
 
-    child.on('close', (exitCode, signal) => {
+    child.on('close', (exitCode, nodeSignal) => {
       if (settled) return;
       settled = true;
-      clearTimeout(timeoutTimer);
-      clearTimeout(killTimer);
+      cleanup();
 
-      if (signal === 'SIGTERM' || signal === 'SIGKILL') {
-        reject(new TimeoutError(`${label} timed out after ${timeoutMs}ms and was killed`, {
-          context: { cmdPath, timeoutMs, stderrTail },
-        }));
+      if (killReason === 'timeout' || nodeSignal === 'SIGTERM' || nodeSignal === 'SIGKILL') {
+        if (killReason === 'abort') {
+          reject(new ProcessingError(`${label} was cancelled`, { context: { cmdPath, stderrTail } }));
+        } else {
+          reject(new TimeoutError(`${label} timed out after ${timeoutMs}ms and was killed`, {
+            context: { cmdPath, timeoutMs, stderrTail },
+          }));
+        }
+        return;
+      }
+      if (killReason === 'abort') {
+        reject(new ProcessingError(`${label} was cancelled`, { context: { cmdPath, stderrTail } }));
         return;
       }
 
@@ -88,12 +126,53 @@ function redactArgs(args) {
 
 export async function checkFfmpegAvailable(ffmpegPath = 'ffmpeg') {
   try {
-    const { stdout } = await runProcess(ffmpegPath, ['-version'], { timeoutMs: 10_000, label: 'ffmpeg' });
-    const versionLine = stdout.split('\n')[0] || '';
+    const result = await new Promise((resolve, reject) => {
+      let out = '';
+      let child;
+      try {
+        child = spawn(ffmpegPath, ['-version'], { windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] });
+      } catch (cause) {
+        reject(new ProcessingError('Failed to spawn ffmpeg', { cause }));
+        return;
+      }
+      const timer = setTimeout(() => child.kill('SIGKILL'), 10_000);
+      child.stdout.on('data', (c) => { out += c.toString('utf8'); });
+      child.on('error', (cause) => { clearTimeout(timer); reject(new ProcessingError('ffmpeg not available', { cause })); });
+      child.on('close', (code) => {
+        clearTimeout(timer);
+        if (code !== 0) { reject(new ProcessingError(`ffmpeg -version exited with code ${code}`)); return; }
+        resolve(out);
+      });
+    });
+    const versionLine = result.split('\n')[0] || '';
     return { available: true, version: versionLine.trim() };
   } catch (err) {
     return { available: false, error: err };
   }
+}
+
+/** Parses ffmpeg `-progress pipe:1` key=value lines into a 0-100 percent, given a known total duration. */
+function makeProgressParser(totalDurationSeconds, onProgress) {
+  return (line) => {
+    const match = /^out_time_ms=(-?\d+)/.exec(line) || /^out_time_us=(-?\d+)/.exec(line);
+    if (match && totalDurationSeconds > 0) {
+      const seconds = Number(match[1]) / 1_000_000;
+      const percent = Math.max(0, Math.min(100, (seconds / totalDurationSeconds) * 100));
+      onProgress(percent);
+      return;
+    }
+    if (line.startsWith('progress=end')) {
+      onProgress(100);
+    }
+  };
+}
+
+function progressArgs({ totalDurationSeconds, onProgress }) {
+  if (!onProgress || !totalDurationSeconds) return { extraArgs: [], onStdoutLine: undefined };
+  return {
+    extraArgs: ['-progress', 'pipe:1', '-nostats'],
+    onStdoutLine: makeProgressParser(totalDurationSeconds, onProgress),
+  };
 }
 
 /**
@@ -103,10 +182,15 @@ export async function checkFfmpegAvailable(ffmpegPath = 'ffmpeg') {
  * implicit mapping silently dropped video/audio when extra streams were
  * present.
  */
-export async function muxToMp4({ videoPath, audioPath, outPath, ffmpegPath = 'ffmpeg', timeoutMs }) {
+export async function muxToMp4({
+  videoPath, audioPath, outPath, ffmpegPath = 'ffmpeg', timeoutMs, signal,
+  totalDurationSeconds, onProgress,
+}) {
+  const { extraArgs, onStdoutLine } = progressArgs({ totalDurationSeconds, onProgress });
   const args = [
     '-y',
     '-loglevel', 'error',
+    ...extraArgs,
     '-i', videoPath,
     '-i', audioPath,
     '-map', '0:v:0',
@@ -117,15 +201,20 @@ export async function muxToMp4({ videoPath, audioPath, outPath, ffmpegPath = 'ff
     '-f', 'mp4',
     outPath,
   ];
-  await runProcess(ffmpegPath, args, { timeoutMs, label: 'ffmpeg (mux mp4)' });
+  await runProcess(ffmpegPath, args, { timeoutMs, label: 'ffmpeg (mux mp4)', signal, onStdoutLine });
   return outPath;
 }
 
 /** Remuxes a single input file into an MP4 container without re-encoding. */
-export async function remuxToMp4({ inputPath, outPath, ffmpegPath = 'ffmpeg', timeoutMs }) {
+export async function remuxToMp4({
+  inputPath, outPath, ffmpegPath = 'ffmpeg', timeoutMs, signal,
+  totalDurationSeconds, onProgress,
+}) {
+  const { extraArgs, onStdoutLine } = progressArgs({ totalDurationSeconds, onProgress });
   const args = [
     '-y',
     '-loglevel', 'error',
+    ...extraArgs,
     '-i', inputPath,
     '-map', '0:v:0',
     '-map', '0:a:0?',
@@ -135,22 +224,27 @@ export async function remuxToMp4({ inputPath, outPath, ffmpegPath = 'ffmpeg', ti
     '-f', 'mp4',
     outPath,
   ];
-  await runProcess(ffmpegPath, args, { timeoutMs, label: 'ffmpeg (remux mp4)' });
+  await runProcess(ffmpegPath, args, { timeoutMs, label: 'ffmpeg (remux mp4)', signal, onStdoutLine });
   return outPath;
 }
 
 const BITRATE_TO_FLAG = { 128: '128k', 192: '192k', 256: '256k', 320: '320k' };
 
 /** Extracts/transcodes the audio track of an input file into an MP3 at the given bitrate. */
-export async function extractToMp3({ inputPath, outPath, bitrateKbps, ffmpegPath = 'ffmpeg', timeoutMs }) {
+export async function extractToMp3({
+  inputPath, outPath, bitrateKbps, ffmpegPath = 'ffmpeg', timeoutMs, signal,
+  totalDurationSeconds, onProgress,
+}) {
   const flag = BITRATE_TO_FLAG[Number(bitrateKbps)];
   if (!flag) {
     throw new ProcessingError(`Unsupported MP3 bitrate: ${bitrateKbps}`, { context: { bitrateKbps } });
   }
 
+  const { extraArgs, onStdoutLine } = progressArgs({ totalDurationSeconds, onProgress });
   const args = [
     '-y',
     '-loglevel', 'error',
+    ...extraArgs,
     '-i', inputPath,
     '-vn',
     '-c:a', 'libmp3lame',
@@ -158,7 +252,7 @@ export async function extractToMp3({ inputPath, outPath, bitrateKbps, ffmpegPath
     '-f', 'mp3',
     outPath,
   ];
-  await runProcess(ffmpegPath, args, { timeoutMs, label: 'ffmpeg (mp3)' });
+  await runProcess(ffmpegPath, args, { timeoutMs, label: 'ffmpeg (mp3)', signal, onStdoutLine });
   return outPath;
 }
 

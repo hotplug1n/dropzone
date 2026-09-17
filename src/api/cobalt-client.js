@@ -51,12 +51,51 @@ function classifyApiError(code, httpStatus) {
   });
 }
 
+// A failure is worth retrying only when it's plausibly transient: network
+// errors, timeouts, and 5xx. 4xx (bad request, auth, media-not-found,
+// rate-limited) are deterministic — retrying them just wastes time and, for
+// rate limits, makes things worse.
+function isRetryable(err) {
+  if (err instanceof TimeoutError) return true;
+  if (err instanceof ApiError) {
+    const status = err.context?.httpStatus;
+    return typeof status === 'number' && status >= 500;
+  }
+  return false;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Merges an internal timeout AbortController with an optional caller-supplied signal. */
+function combineSignals(externalSignal, timeoutMs) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(new Error('timeout')), timeoutMs);
+
+  const onExternalAbort = () => controller.abort(externalSignal.reason);
+  if (externalSignal) {
+    if (externalSignal.aborted) controller.abort(externalSignal.reason);
+    else externalSignal.addEventListener('abort', onExternalAbort, { once: true });
+  }
+
+  return {
+    signal: controller.signal,
+    cleanup: () => {
+      clearTimeout(timer);
+      externalSignal?.removeEventListener('abort', onExternalAbort);
+    },
+  };
+}
+
 export class CobaltClient {
   /**
    * @param {object} opts
    * @param {string} opts.baseUrl - Base URL of a Cobalt-compatible instance.
    * @param {string} [opts.apiKey] - Optional Api-Key credential.
-   * @param {number} [opts.timeoutMs]
+   * @param {number} [opts.connectTimeoutMs] - Timeout for the POST / and GET / calls.
+   * @param {number} [opts.requestTimeoutMs] - Timeout for streaming a tunnel/redirect file.
+   * @param {number} [opts.retries] - Retries for the metadata call on transient failures.
    * @param {number} [opts.maxFileSizeBytes]
    * @param {typeof fetch} [opts.fetchImpl] - Injectable for testing.
    * @param {(url: string) => Promise<void>} [opts.assertSafeUrl] - Injectable
@@ -65,15 +104,17 @@ export class CobaltClient {
    *   loopback fixture server); production code must keep the default.
    */
   constructor({
-    baseUrl, apiKey = '', timeoutMs = 120_000, maxFileSizeBytes = 1024 ** 3,
-    fetchImpl = fetch, assertSafeUrl = assertSafeRemoteUrl,
+    baseUrl, apiKey = '', connectTimeoutMs = 10_000, requestTimeoutMs = 180_000, retries = 2,
+    maxFileSizeBytes = 1024 ** 3, fetchImpl = fetch, assertSafeUrl = assertSafeRemoteUrl,
   }) {
     if (!baseUrl) {
       throw new ConfigurationError('COBALT_API_URL is not configured. Point it at your own, self-hosted or explicitly authorized Cobalt-compatible instance.');
     }
     this.baseUrl = baseUrl.replace(/\/+$/, '');
     this.apiKey = apiKey;
-    this.timeoutMs = timeoutMs;
+    this.connectTimeoutMs = connectTimeoutMs;
+    this.requestTimeoutMs = requestTimeoutMs;
+    this.retries = retries;
     this.maxFileSizeBytes = maxFileSizeBytes;
     this.fetchImpl = fetchImpl;
     this.assertSafeUrl = assertSafeUrl;
@@ -93,54 +134,98 @@ export class CobaltClient {
     return true;
   }
 
-  async requestDownload(payload) {
-    this.validateUrl(payload.url);
+  _authHeaders() {
+    const headers = { Accept: 'application/json' };
+    if (this.apiKey) headers.Authorization = `Api-Key ${this.apiKey}`;
+    return headers;
+  }
 
-    const headers = {
-      Accept: 'application/json',
-      'Content-Type': 'application/json',
-    };
-    if (this.apiKey) {
-      headers.Authorization = `Api-Key ${this.apiKey}`;
-    }
-
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
-
-    let res;
+  async _fetchJson(url, init, { signal: externalSignal } = {}) {
+    const { signal, cleanup } = combineSignals(externalSignal, this.connectTimeoutMs);
     try {
-      res = await this.fetchImpl(`${this.baseUrl}/`, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify(payload),
-        signal: controller.signal,
-      });
-    } catch (cause) {
-      if (cause.name === 'AbortError') {
-        throw new TimeoutError('Timed out waiting for Cobalt API response', {
-          context: { url: this.baseUrl, timeoutMs: this.timeoutMs },
+      const res = await this.fetchImpl(url, { ...init, signal });
+      let body;
+      try {
+        body = await res.json();
+      } catch (cause) {
+        throw new ApiError('Cobalt API returned a non-JSON or malformed response', {
+          context: { httpStatus: res.status },
           cause,
         });
       }
-      throw new ApiError('Network error while contacting Cobalt API', {
-        context: { url: this.baseUrl },
-        cause,
-      });
-    } finally {
-      clearTimeout(timer);
-    }
-
-    let body;
-    try {
-      body = await res.json();
+      return { status: res.status, body };
     } catch (cause) {
-      throw new ApiError('Cobalt API returned a non-JSON or malformed response', {
-        context: { httpStatus: res.status },
-        cause,
-      });
+      if (cause instanceof ApiError) throw cause;
+      if (cause.name === 'AbortError' || signal.aborted) {
+        throw new TimeoutError('Timed out contacting the Cobalt API', {
+          context: { url, timeoutMs: this.connectTimeoutMs },
+          cause,
+        });
+      }
+      throw new ApiError('Network error while contacting Cobalt API', { context: { url }, cause });
+    } finally {
+      cleanup();
     }
+  }
 
-    return this.parseResponse(res.status, body);
+  async _withRetry(fn) {
+    let lastErr;
+    for (let attempt = 0; attempt <= this.retries; attempt++) {
+      try {
+        return await fn();
+      } catch (err) {
+        lastErr = err;
+        if (attempt === this.retries || !isRetryable(err)) throw err;
+        await sleep(2 ** attempt * 250);
+      }
+    }
+    throw lastErr;
+  }
+
+  /**
+   * GET / — cobalt's "provides basic instance info" endpoint (docs/api.md).
+   * Used both as a real health check and to confirm the configured instance
+   * actually speaks the Cobalt API contract (has cobalt.version/services),
+   * rather than assuming any 200 response means "connected".
+   */
+  async getInstanceInfo({ signal } = {}) {
+    return this._withRetry(async () => {
+      const { status, body } = await this._fetchJson(`${this.baseUrl}/`, {
+        method: 'GET',
+        headers: this._authHeaders(),
+      }, { signal });
+
+      if (status < 200 || status >= 300) {
+        throw new ApiError(`Cobalt instance info request failed with HTTP ${status}`, {
+          context: { httpStatus: status },
+        });
+      }
+      if (!body?.cobalt?.version || !Array.isArray(body?.cobalt?.services)) {
+        throw new ApiError('Response does not look like a Cobalt instance (missing cobalt.version/services)', {
+          context: { body },
+        });
+      }
+      return {
+        version: body.cobalt.version,
+        services: body.cobalt.services,
+        url: body.cobalt.url,
+        startTime: body.cobalt.startTime,
+      };
+    });
+  }
+
+  async requestDownload(payload, { signal } = {}) {
+    this.validateUrl(payload.url);
+
+    return this._withRetry(async () => {
+      const { status, body } = await this._fetchJson(`${this.baseUrl}/`, {
+        method: 'POST',
+        headers: { ...this._authHeaders(), 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }, { signal });
+
+      return this.parseResponse(status, body);
+    });
   }
 
   parseResponse(httpStatus, body) {
@@ -219,20 +304,22 @@ export class CobaltClient {
    * Downloads a remote URL to a local file, enforcing SSRF protections and a
    * hard size cap. Used for tunnel/redirect/local-processing URLs, which
    * originate from the (trusted-but-verified) Cobalt-compatible backend.
+   * Never retried automatically: retrying a partially-written file from
+   * scratch is the caller's decision, not something to hide silently.
    */
-  async downloadToFile(urlString, destPath) {
+  async downloadToFile(urlString, destPath, { signal: externalSignal } = {}) {
     await this.assertSafeUrl(urlString);
 
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    const { signal, cleanup } = combineSignals(externalSignal, this.requestTimeoutMs);
 
     let res;
     try {
-      res = await this.fetchImpl(urlString, { signal: controller.signal });
+      res = await this.fetchImpl(urlString, { signal });
     } catch (cause) {
-      if (cause.name === 'AbortError') {
+      cleanup();
+      if (cause.name === 'AbortError' || signal.aborted) {
         throw new TimeoutError('Timed out downloading media file', {
-          context: { urlString, timeoutMs: this.timeoutMs },
+          context: { urlString, timeoutMs: this.requestTimeoutMs },
           cause,
         });
       }
@@ -240,11 +327,10 @@ export class CobaltClient {
         context: { urlString },
         cause,
       });
-    } finally {
-      clearTimeout(timer);
     }
 
     if (!res.ok) {
+      cleanup();
       throw new DownloadError(`Media server responded with HTTP ${res.status}`, {
         context: { urlString, httpStatus: res.status },
       });
@@ -252,12 +338,14 @@ export class CobaltClient {
 
     const contentLength = res.headers.get('content-length');
     if (contentLength && Number(contentLength) > this.maxFileSizeBytes) {
+      cleanup();
       throw new DownloadError('Remote file exceeds the configured maximum size', {
         context: { urlString, contentLength, maxFileSizeBytes: this.maxFileSizeBytes },
       });
     }
 
     if (!res.body) {
+      cleanup();
       throw new DownloadError('Response has no body to stream', { context: { urlString } });
     }
 
@@ -282,14 +370,22 @@ export class CobaltClient {
       await pipeline(nodeReadable, sizeGuard, fs.createWriteStream(destPath));
     } catch (cause) {
       if (cause instanceof DownloadError) throw cause;
+      if (cause.name === 'AbortError' || signal.aborted) {
+        throw new TimeoutError('Timed out downloading media file', {
+          context: { urlString, timeoutMs: this.requestTimeoutMs },
+          cause,
+        });
+      }
       throw new DownloadError('Failed while streaming media file to disk', {
         context: { urlString, destPath },
         cause,
       });
+    } finally {
+      cleanup();
     }
 
     return { path: destPath, bytes: bytesWritten };
   }
 }
 
-export { classifyApiError, SecurityError };
+export { classifyApiError, isRetryable, SecurityError };

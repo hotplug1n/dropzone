@@ -26,7 +26,15 @@ function jsonResponse(status, body, headers = {}) {
 }
 
 function makeClient(fetchImpl, extra = {}) {
-  return new CobaltClient({ baseUrl: 'http://cobalt.internal.test', apiKey: '', timeoutMs: 2000, fetchImpl, ...extra });
+  return new CobaltClient({
+    baseUrl: 'http://cobalt.internal.test',
+    apiKey: '',
+    connectTimeoutMs: 2000,
+    requestTimeoutMs: 2000,
+    retries: 0, // deterministic, fast unit tests; retry behavior has its own dedicated tests below
+    fetchImpl,
+    ...extra,
+  });
 }
 
 test('missing COBALT_API_URL throws ConfigurationError', () => {
@@ -115,8 +123,76 @@ test('network timeout raises TimeoutError', async () => {
       err.name = 'AbortError';
       reject(err);
     });
-  }), { timeoutMs: 50 });
+  }), { connectTimeoutMs: 50, retries: 0 });
   await assert.rejects(() => client.requestDownload({ url: 'https://x' }), TimeoutError);
+});
+
+test('retries a 5xx error and succeeds on the next attempt', async () => {
+  let calls = 0;
+  const client = makeClient(async () => {
+    calls += 1;
+    if (calls === 1) return jsonResponse(500, { status: 'error', error: { code: 'error.api.fetch.critical.core' } });
+    return jsonResponse(200, { status: 'tunnel', url: 'https://cdn.test/x', filename: 'a.mp4' });
+  }, { retries: 2 });
+
+  const r = await client.requestDownload({ url: 'https://x' });
+  assert.equal(calls, 2);
+  assert.equal(r.kind, 'tunnel');
+});
+
+test('does not retry a deterministic 4xx error (e.g. media unavailable)', async () => {
+  let calls = 0;
+  const client = makeClient(async () => {
+    calls += 1;
+    return jsonResponse(400, { status: 'error', error: { code: 'content.video.private' } });
+  }, { retries: 3 });
+
+  await assert.rejects(() => client.requestDownload({ url: 'https://x' }), MediaUnavailableError);
+  assert.equal(calls, 1, 'a 4xx/deterministic error must not be retried');
+});
+
+test('gives up after exhausting all retries on persistent 5xx errors', async () => {
+  let calls = 0;
+  const client = makeClient(async () => {
+    calls += 1;
+    return jsonResponse(503, { status: 'error', error: { code: 'error.api.fetch.critical.core' } });
+  }, { retries: 2 });
+
+  await assert.rejects(() => client.requestDownload({ url: 'https://x' }), ApiError);
+  assert.equal(calls, 3, 'expected 1 initial attempt + 2 retries');
+});
+
+test('getInstanceInfo returns version/services for a well-formed instance response', async () => {
+  const client = makeClient(async () => jsonResponse(200, {
+    cobalt: { version: '11.7.1', url: 'https://cobalt.local', startTime: '123', services: ['youtube', 'tiktok'] },
+  }));
+  const info = await client.getInstanceInfo();
+  assert.equal(info.version, '11.7.1');
+  assert.deepEqual(info.services, ['youtube', 'tiktok']);
+});
+
+test('getInstanceInfo raises ApiError when the response does not look like Cobalt', async () => {
+  const client = makeClient(async () => jsonResponse(200, { hello: 'world' }));
+  await assert.rejects(() => client.getInstanceInfo(), ApiError);
+});
+
+test('getInstanceInfo raises ApiError on non-2xx status', async () => {
+  const client = makeClient(async () => jsonResponse(503, { error: 'unavailable' }));
+  await assert.rejects(() => client.getInstanceInfo(), ApiError);
+});
+
+test('requestDownload honors an external AbortSignal (e.g. client disconnect)', async () => {
+  const controller = new AbortController();
+  const client = makeClient((_url, { signal }) => new Promise((_resolve, reject) => {
+    signal.addEventListener('abort', () => {
+      const err = new Error('aborted');
+      err.name = 'AbortError';
+      reject(err);
+    });
+  }));
+  const promise = client.requestDownload({ url: 'https://x' }, { signal: controller.signal });
+  controller.abort();
+  await assert.rejects(() => promise, TimeoutError);
 });
 
 test('malformed (non-JSON) response raises ApiError', async () => {

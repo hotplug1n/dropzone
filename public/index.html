@@ -3,129 +3,138 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Dropzone — YouTube Downloader</title>
-<style>
-  :root { color-scheme: light dark; }
-  body { font-family: system-ui, sans-serif; max-width: 480px; margin: 40px auto; padding: 0 16px; }
-  fieldset { border: 1px solid #8884; border-radius: 8px; margin-bottom: 16px; }
-  label { display: block; margin: 8px 0; }
-  input[type="url"], select { width: 100%; padding: 8px; box-sizing: border-box; }
-  button { width: 100%; padding: 12px; font-size: 1rem; cursor: pointer; }
-  button:disabled { opacity: 0.6; cursor: not-allowed; }
-  #status { margin-top: 16px; min-height: 1.5em; }
-  #status.error { color: #c0392b; }
-  #status.done { color: #27ae60; }
-  fieldset[disabled] { opacity: 0.5; }
-</style>
+<title>Dropzone</title>
+<meta name="description" content="Dropzone — download técnico de YouTube em MP4/MP3 via Cobalt." />
+<link rel="stylesheet" href="/styles.css" />
 </head>
 <body>
-  <h1>Dropzone</h1>
-  <form id="download-form">
-    <label>
-      URL do YouTube
-      <input type="url" id="url" name="url" placeholder="https://www.youtube.com/watch?v=..." required />
-    </label>
+  <header class="app-header">
+    <div class="logo">DROPZONE<span class="version" id="version-tag">[v1.0.0]</span></div>
+    <nav class="header-actions" aria-label="Navegação principal">
+      <button type="button" class="btn-tag" data-nav="home" aria-current="true">DOWNLOAD</button>
+      <button type="button" class="btn-tag" data-nav="history">HISTORY</button>
+      <button type="button" class="btn-tag" data-nav="settings">SETTINGS</button>
+      <a class="btn-tag" href="https://github.com/imputnet/cobalt" target="_blank" rel="noopener noreferrer">GITHUB</a>
+    </nav>
+  </header>
 
-    <fieldset>
-      <legend>Formato</legend>
-      <label><input type="radio" name="format" value="mp4" checked /> MP4 — Vídeo</label>
-      <label><input type="radio" name="format" value="mp3" /> MP3 — Áudio</label>
-    </fieldset>
+  <main class="container">
 
-    <fieldset id="quality-group">
-      <legend>Qualidade</legend>
-      <select id="quality" name="quality"></select>
-    </fieldset>
+    <!-- HOME / URL INPUT -->
+    <section class="view is-visible" id="view-home" aria-labelledby="home-heading">
+      <h1 class="prompt-line" id="home-heading">paste url</h1>
+      <form id="url-form">
+        <div class="input-row">
+          <span class="caret" aria-hidden="true">&gt;</span>
+          <label for="url-input" class="hidden">URL do YouTube</label>
+          <input
+            id="url-input"
+            class="url-input"
+            type="url"
+            name="url"
+            placeholder="https://youtube.com/watch?v=..."
+            autocomplete="off"
+            spellcheck="false"
+            required
+          />
+          <button type="submit" class="btn-enter" id="enter-btn">[ ENTER ]</button>
+        </div>
+      </form>
 
-    <fieldset id="bitrate-group" disabled>
-      <legend>Bitrate</legend>
-      <select id="bitrate" name="bitrate"></select>
-    </fieldset>
+      <hr class="rule" />
 
-    <button type="submit" id="submit-btn">DOWNLOAD</button>
-  </form>
+      <div class="status-block">
+        <div class="heading">STATUS</div>
+        <div class="status-row">
+          <span class="label">cobalt</span>
+          <span class="value" id="status-cobalt" data-state="unknown"><span class="status-dot" data-state="unknown"></span> checking...</span>
+        </div>
+        <div class="status-row">
+          <span class="label">ffmpeg</span>
+          <span class="value" id="status-ffmpeg" data-state="unknown"><span class="status-dot" data-state="unknown"></span> checking...</span>
+        </div>
+        <div class="status-row">
+          <span class="label">storage</span>
+          <span class="value" id="status-storage" data-state="unknown"><span class="status-dot" data-state="unknown"></span> checking...</span>
+        </div>
+      </div>
+    </section>
 
-  <div id="status" role="status"></div>
+    <!-- INSPECT / SOURCE + FORMAT + QUALITY -->
+    <section class="view" id="view-inspect" aria-labelledby="inspect-heading">
+      <h1 class="prompt-line" id="inspect-heading">inspect</h1>
 
-  <script>
-    const formatRadios = document.querySelectorAll('input[name="format"]');
-    const qualityGroup = document.getElementById('quality-group');
-    const bitrateGroup = document.getElementById('bitrate-group');
-    const qualitySelect = document.getElementById('quality');
-    const bitrateSelect = document.getElementById('bitrate');
-    const statusEl = document.getElementById('status');
-    const submitBtn = document.getElementById('submit-btn');
-    const form = document.getElementById('download-form');
+      <div id="inspect-loading" class="prompt-line" role="status" aria-live="polite">inspecting source...</div>
 
-    function fillSelect(select, values, labelFn) {
-      select.innerHTML = '';
-      for (const v of values) {
-        const opt = document.createElement('option');
-        opt.value = v;
-        opt.textContent = labelFn ? labelFn(v) : v;
-        select.appendChild(opt);
-      }
-    }
+      <div id="inspect-result" class="hidden">
+        <div class="kv-box">
+          <div class="kv-title">SOURCE</div>
+          <div class="thumb-row">
+            <img id="source-thumb" src="" alt="" />
+            <div class="kv-rows">
+              <div class="kv-row"><span class="k">service</span><span class="v" id="source-service">youtube</span></div>
+              <div class="kv-row"><span class="k">title</span><span class="v" id="source-title"></span></div>
+              <div class="kv-row"><span class="k">duration</span><span class="v" id="source-duration"></span></div>
+              <div class="kv-row"><span class="k">author</span><span class="v" id="source-author"></span></div>
+              <div class="kv-row"><span class="k">availability</span><span class="v" id="source-availability"></span></div>
+            </div>
+          </div>
+        </div>
 
-    function syncFieldset() {
-      const format = document.querySelector('input[name="format"]:checked').value;
-      const isMp4 = format === 'mp4';
-      qualityGroup.disabled = !isMp4;
-      bitrateGroup.disabled = isMp4;
-    }
+        <div class="choice-group">
+          <div class="prompt-line">format</div>
+          <div class="choice-row" id="format-choices" role="group" aria-label="Formato de saída"></div>
+        </div>
 
-    async function loadOptions() {
-      const res = await fetch('/api/config');
-      const cfg = await res.json();
-      fillSelect(qualitySelect, cfg.videoQualities, (v) => (v === 'best' ? 'Melhor disponível' : `${v}p`));
-      fillSelect(bitrateSelect, cfg.audioBitrates, (v) => `${v} kbps`);
-      qualitySelect.value = '1080';
-      bitrateSelect.value = '192';
-      syncFieldset();
-    }
+        <div class="choice-group" id="quality-group">
+          <div class="prompt-line" id="quality-label">quality</div>
+          <div class="choice-row" id="quality-choices" role="group" aria-label="Qualidade"></div>
+        </div>
 
-    formatRadios.forEach((r) => r.addEventListener('change', syncFieldset));
-    loadOptions();
+        <button type="button" class="btn-primary" id="download-btn">[ DOWNLOAD ]</button>
+      </div>
 
-    form.addEventListener('submit', (e) => {
-      e.preventDefault();
-      const url = document.getElementById('url').value.trim();
-      const format = document.querySelector('input[name="format"]:checked').value;
-      const quality = qualitySelect.value;
-      const bitrate = bitrateSelect.value;
+      <div id="inspect-error" class="hidden"></div>
+    </section>
 
-      submitBtn.disabled = true;
-      statusEl.className = '';
-      statusEl.textContent = 'Validando URL...';
+    <!-- DOWNLOAD PROGRESS -->
+    <section class="view" id="view-download" aria-labelledby="download-heading">
+      <h1 class="prompt-line" id="download-heading">download</h1>
+      <div class="log-block" id="download-log" role="status" aria-live="polite"></div>
+      <div id="download-error" class="hidden" style="margin-top: 1rem;"></div>
+    </section>
 
-      const params = new URLSearchParams({ url, format, quality, bitrate });
-      const source = new EventSource(`/api/download-stream?${params.toString()}`);
+    <!-- DONE -->
+    <section class="view" id="view-done" aria-labelledby="done-heading">
+      <h1 class="prompt-line" id="done-heading">done</h1>
+      <div class="kv-box">
+        <div class="kv-title">FILE</div>
+        <div class="kv-row"><span class="k">name</span><span class="v" id="done-name"></span></div>
+        <div class="kv-row"><span class="k">size</span><span class="v" id="done-size"></span></div>
+        <div class="kv-row"><span class="k">type</span><span class="v" id="done-type"></span></div>
+      </div>
+      <a class="btn-primary" id="save-file-btn" style="text-align:center; text-decoration:none;" download>[ SAVE FILE ]</a>
+      <button type="button" class="retry-link" data-nav="home">baixar outro vídeo</button>
+    </section>
 
-      source.addEventListener('progress', (ev) => {
-        const { step } = JSON.parse(ev.data);
-        statusEl.textContent = step;
-      });
+    <!-- HISTORY -->
+    <section class="view" id="view-history" aria-labelledby="history-heading">
+      <h1 class="prompt-line" id="history-heading">history</h1>
+      <div id="history-content"></div>
+    </section>
 
-      source.addEventListener('done', (ev) => {
-        const { downloadUrl, filename } = JSON.parse(ev.data);
-        statusEl.className = 'done';
-        statusEl.innerHTML = `Concluído. <a href="${downloadUrl}" download>${filename}</a>`;
-        submitBtn.disabled = false;
-        source.close();
-      });
+    <!-- SETTINGS -->
+    <section class="view" id="view-settings" aria-labelledby="settings-heading">
+      <h1 class="prompt-line" id="settings-heading">settings</h1>
+      <div id="settings-content"></div>
+    </section>
 
-      source.addEventListener('error', (ev) => {
-        submitBtn.disabled = false;
-        statusEl.className = 'error';
-        if (ev.data) {
-          const { code, message } = JSON.parse(ev.data);
-          statusEl.textContent = `Não foi possível concluir o download. Código: ${code}. Detalhes: ${message}`;
-        } else {
-          statusEl.textContent = 'Não foi possível concluir o download. Verifique sua conexão.';
-        }
-        source.close();
-      });
-    });
-  </script>
+    <p class="footnote">
+      dropzone usa uma instância Cobalt própria/autorizada como backend — nunca uma instância pública sem permissão.
+      use apenas para conteúdo que você tem direito de baixar.
+    </p>
+  </main>
+
+  <script src="/app.js"></script>
 </body>
 </html>

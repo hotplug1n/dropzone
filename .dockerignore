@@ -1,0 +1,11 @@
+node_modules
+downloads
+tmp
+data
+.env
+.env.*
+!.env.example
+.git
+test
+docs
+*.md

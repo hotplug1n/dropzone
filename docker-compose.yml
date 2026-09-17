@@ -1,0 +1,60 @@
+# Reproducible local/dev stack: Dropzone + an official Cobalt instance.
+#
+# Image reference confirmed against imputnet/cobalt's own
+# docs/examples/docker-compose.example.yml (ghcr.io/imputnet/cobalt:11) —
+# not invented. Cobalt's API_URL is set to the in-network service name
+# because Dropzone's backend (not the browser) is the one that calls
+# tunnel/redirect URLs directly (see src/api/cobalt-client.js) — this stack
+# never exposes Cobalt outside the compose network.
+services:
+  cobalt:
+    image: ghcr.io/imputnet/cobalt:11
+    init: true
+    read_only: true
+    restart: unless-stopped
+    container_name: dropzone-cobalt
+    environment:
+      API_URL: "http://cobalt:9000/"
+    ports:
+      # Exposed on localhost only, for local debugging (curl/health checks
+      # from the host). Remove this in a real deployment.
+      - "127.0.0.1:9000:9000"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:9000/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - dropzone-net
+
+  dropzone:
+    build: .
+    restart: unless-stopped
+    container_name: dropzone-app
+    depends_on:
+      cobalt:
+        condition: service_healthy
+    environment:
+      COBALT_API_URL: "http://cobalt:9000/"
+      PORT: "8080"
+    ports:
+      - "8080:8080"
+    volumes:
+      - dropzone-downloads:/app/downloads
+      - dropzone-data:/app/data
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/api/config').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - dropzone-net
+
+networks:
+  dropzone-net:
+
+volumes:
+  dropzone-downloads:
+  dropzone-data:
